@@ -1,0 +1,325 @@
+---
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# Load necessary libraries
+library(openxlsx)
+library(tidyverse)
+library(tableone)
+library(lme4)
+library(splines)
+library(patchwork)
+library(gridExtra)
+library(survival)
+library(JMbayes)
+
+# Load data
+
+df.clin <- read.csv("C9_clinicaldata.csv", stringsAsFactors = TRUE)
+df.snip <- read.csv("C9_SNIPdata.csv", stringsAsFactors = FALSE)
+df.alsfrs <- read.csv("C9_ALSFRSdata.csv", stringsAsFactors = FALSE)
+
+# set bootstrap replicates
+boots <- 500
+cpus <- 10
+
+# Set theme for graphs
+theme.apply <- theme(panel.background = element_rect(fill = 'white'),
+                     panel.grid.major.y = element_line(colour = "grey90", size=0.5),
+                     panel.grid.major.x = element_line(colour = "grey95", size=0.5),
+                     plot.title = element_text(size=14, face="bold"),
+                     legend.title = element_text(size=16, face="bold"),
+                     axis.title.x = element_text(size=18),
+                     axis.title.y = element_text(size=18, vjust=0.5),
+                     axis.text.x = element_text(size=15, face="bold"),
+                     axis.text.y = element_text(size=15, face="bold", angle=25))
+
+##############################
+# Prepare datasets
+
+# 1. Reorder factor levels in clinical data so set Spinal onset and C9 Normal as base levels
+df.clin$simp_site <- factor(df.clin$simp_site, levels = c("Spinal", "Bulbar"))
+df.clin$C9 <- factor(df.clin$C9, levels = c("Normal", "Expanded"))
+
+
+# 2. Add clinical data to longitudinal metrics
+df.snip$sex <- df.clin[match(df.snip$ID, df.clin$ID), ]$sex
+df.snip$site <- df.clin[match(df.snip$ID, df.clin$ID), ]$simp_site
+df.snip$C9 <- df.clin[match(df.snip$ID, df.clin$ID), ]$C9
+
+df.alsfrs$sex <- df.clin[match(df.alsfrs$ID, df.clin$ID), ]$sex
+df.alsfrs$site <- df.clin[match(df.alsfrs$ID, df.clin$ID), ]$simp_site
+df.alsfrs$C9 <- df.clin[match(df.alsfrs$ID, df.clin$ID), ]$C9
+df.alsfrs$surv_t_months <- df.clin[match(df.alsfrs$ID, df.clin$ID), ]$surv_t_months
+
+# 3. Create dataframes limited to 6 years (72 months) follow-ups
+df.snip_72m <- df.snip[df.snip$onset2snip_mnths <= 72, ]
+df.clin_72m <- df.clin[ df.clin$ID %in% df.snip_72m$ID, ]
+df.alsfrs_72m <- df.alsfrs[ (df.alsfrs$ID %in% df.snip_72m$ID) &
+                                df.alsfrs$alsfrs_dly_mnths <=72, ]
+# In case of tracheotomy ALSFRS may be present after surv_t_months as tracheotomy is
+# an outcome. Remove these readings
+df.alsfrs_72m <- df.alsfrs_72m[ df.alsfrs_72m$alsfrs_dly_mnths <
+                                    df.alsfrs_72m$surv_t_months, ]
+# add snip to alsfrs data
+df.alsfrs_72m <- left_join(df.alsfrs_72m, df.snip_72m[, c("ID", "SNIP_date", "SNIP.occ")], by = c("ID" = "ID",
+                                                     "ALSFRS_Date" = "SNIP_date"))
+df.alsfrs_72m <- df.alsfrs_72m[!is.na(df.alsfrs_72m$SNIP.occ), ]
+
+
+
+# 4. Reorder datasets in order of ID and time for use in joint models
+df.clin_72m <- df.clin_72m[order(df.clin_72m$ID), ]
+df.snip_72m <- df.snip_72m[order(df.snip_72m$ID, df.snip_72m$SNIP_date), ]
+df.alsfrs_72m <- df.alsfrs_72m[order(df.alsfrs_72m$ID,
+                                     df.alsfrs_72m$alsfrs_dly_mnths), ]
+
+```
+
+## The C9orf72 expansion is associated with accelerated respiratory function decline in a large Amyotrophic Lateral Sclerosis cohort
+
+##### Authors: James Rooney(1), Deirdre Murray(1,2), Anna Campion(2), Hannah Moloney(1), Rachel Tattersall(2), Mark Doherty(3), Michaela Hammond(1), Mark Heverin(1), Russell McLaughlin(3), Orla Hardiman(1,2).
+
+##### Affiliations: 1. Academic Unit of Neurology, Trinity College Dublin. 2. Beaumont Hospital, Dublin, Ireland. 3. Smurfit Institute of Genetics, Trinity College Dublin, Dublin, Ireland.
+
+https://www.tcd.ie/medicine/neurology/
+
+This R Markdown file details the analysis for the paper of the same title. A full description of the background, methods, population, statistical analysis plan and results can by found therein.
+
+
+### Table 1. Demographics of study patients by diagnosis
+```{r descriptives}
+##### Descriptive Statistics
+vars <- c("sex", "simp_site", "dx_delay", "age_on", "surv_t_months")
+factorVars <- c("Diagnosis", "sex", "simp_site")
+tab1 <- CreateTableOne(vars = vars, factorVars = factorVars, data=df.clin_72m,
+                       strata = "C9", test = TRUE)
+tab1.export <- print(tab1, quote = FALSE, noSpaces = TRUE,
+                     printToggle = FALSE, showAllLevels = TRUE,
+                     nonnormal = c("dx_delay","surv_t_months"))
+
+print(tab1.export)
+```
+
+\newpage
+# Define a linear mixed model of SNIP vs C9 status
+First, we will build a linear mixed model of SNIP by C9 status with and without spline terms on the time variable:
+```{r C9_mixed, echo=TRUE}
+mm_C9 <- lmer(SNIP.occ ~ onset2snip_mnths*C9 + (onset2snip_mnths  | ID),
+                 data = df.snip_72m, REML = FALSE, control = lmerControl(optimizer ="Nelder_Mead"))
+mm_C9_sp <- lmer(SNIP.occ ~ ns(onset2snip_mnths, 2) *C9 + 
+                     ( ns(onset2snip_mnths, 2)  | ID),
+                 data = df.snip_72m, REML = FALSE, control = lmerControl(optimizer ="Nelder_Mead"))
+anova(mm_C9, mm_C9_sp, test = "LRT")
+```
+
+The likelihood ratio test indicates that splines improve the fit. Summary of spline model:
+```{r summ_C9sp}
+summary(mm_C9_sp)
+```
+
+Since we know a priori that there is differential follow up of the longitudinal variables by C9 status owing to the poorer prognosis associated with carriage of the C9orf72 expansion, we will construct a joint longitudinal and time to event model which can account for such differential loss to follow-up. Therefore we must first define a Cox model. We will include known ALS prognostic variables in Cox model: age of onset, diagnostic delay, site of onset and C9 status. A delayed entry model will be specified using diagnostic delay as time of entry.
+
+### Define a Cox survival model
+``` {r cox_model, echo=FALSE}
+# Define survival fail variable
+df.clin_72m$fail <- ifelse(df.clin_72m$vital_status == "Alive", 0, 1)
+# Add small amount to survival time to avoid model errors
+df.clin_72m$surv_t2_months <- df.clin_72m$surv_t_months + 0.0001
+# copy dx_delay variable to allow on both sides formula
+df.clin_72m$dx_delay2 <- df.clin_72m$dx_delay
+coxC9 <- coxph(Surv(time = dx_delay, time2 = surv_t2_months, fail) ~ age_on +
+                   dx_delay2 + simp_site + C9,
+               data = df.clin_72m, x = TRUE, model = TRUE)
+```
+Summary of Cox model:
+```{r}
+summary(coxC9)
+```
+Cox model results are compatible with previous literature for Irish ALS cohorts.
+
+
+### Define a joint longtiudinal and time to event model
+``` {r jm_c9, echo=FALSE}
+# Joint models require use of the nlme package, therefore need to re build 
+# longitudinal model in nlme format
+lmeC9 <- lme(SNIP.occ ~ ns(onset2snip_mnths, 2) * C9,
+             random = ~ ns(onset2snip_mnths, 2)  | ID,
+                 data = df.snip_72m)
+
+# Fit a joint model for both C9 longitudinal model and reference model
+JMFit_C9 <- jointModelBayes(lmeC9, coxC9, timeVar = "onset2snip_mnths",
+                            verbose = FALSE)
+```
+
+Summary of the joint model:
+```{r}
+summary(JMFit_C9)
+```
+
+Summary of the JM event process on exponential scale (i.e. to get Hazard Ratios)
+```{r}
+format(exp(summary(JMFit_C9)$`CoefTable-Event`), digits = 3)
+```
+
+The Event process results indicate that the longitudinal value (Assoct) is
+associated with survival in the JM. Dx delay and age remain important while
+bulbar onset and C9 expansion lose importance.
+
+Next we generate a plot of predicted SNIP values from joint model fit:
+
+```{r c9_plot, echo=FALSE}
+
+# Plot JM
+nd <- df.snip_72m
+nd <- predict(JMFit_C9, newdata=nd, interval="conf", returnData = TRUE)
+nd$se.fit <- NULL
+names(nd)[ (ncol(nd)-2): ncol(nd)] <- c("JM.pred", "JM.pred.lo", "JM.pred.hi")
+
+g_JM_C9 <- ggplot(nd, aes(x=onset2snip_mnths, y = JM.pred, col=C9)) +
+    geom_line() +
+    geom_ribbon(aes(ymin=JM.pred.lo, ymax=JM.pred.hi, fill=C9, linetype=NA), 
+                alpha=0.15) +
+    theme.apply + coord_cartesian(xlim=c(0, 72), ylim=c(0, 100)) +
+    scale_x_continuous(breaks = c(0, 12, 24, 36, 48, 60, 72)) + 
+    labs(x="\nTime from onset (months)", y="cmH2O\n") +
+    ggtitle(label = "Predicted occluded SNIP by C9orf72 status")
+print(g_JM_C9)
+# Save plot to file
+tiff('Graphs/Figure1.tiff', width=1000, height=700, res=108)
+    print(g_JM_C9)
+dev.off()
+
+```
+
+Predicted outcomes from the JM indicate that C9 patients have lower SNIP values
+across the follow-up time. Both normal and C9 expanded cases exhibit non-linear
+although this is more apparent in the normal cases.
+
+
+How does the ALSFRS respiratory score characterise C9 modelled versus the same explatory variables in
+the joint model? -> note that not all patients have ALSFRS data therefore the Cox
+model also needs to be re-specified.
+```{r}
+length(unique(df.snip_72m$ID))
+length(unique(df.alsfrs_72m$ID))
+```
+
+``` {r jm_alsfrs, echo=FALSE}
+lmeALSFRS <- lme(resp_score ~ ns(alsfrs_dly_mnths, 2) * C9,
+             random = ~ ns(alsfrs_dly_mnths, 2)  | ID,
+                 data = df.alsfrs_72m)
+coxALSFRS <- coxph(Surv(time = dx_delay, time2 = surv_t2_months, fail) ~ age_on +
+                       dx_delay2 + simp_site + C9,
+               data = df.clin_72m[df.clin_72m$ID %in% df.alsfrs_72m$ID, ],
+               x = TRUE, model = TRUE)
+
+# Fit a joint model for both - longitudinal value only
+JMFit_ALSFRS <- jointModelBayes(lmeALSFRS, coxALSFRS,
+                                timeVar = "alsfrs_dly_mnths", verbose = FALSE)
+```
+
+Summary of ALSFRS JM:
+```{r}
+summary(JMFit_ALSFRS)
+```
+
+Next we generate a plot of predicted ALSFRS values from joint model fit:
+
+```{r alsfrs_plot, echo=FALSE}
+
+# Plot JM
+nd_alsfrs <- df.alsfrs_72m
+nd_alsfrs <- predict(JMFit_ALSFRS, newdata=nd_alsfrs, interval="conf", 
+                     returnData = TRUE)
+nd_alsfrs$se.fit <- NULL
+names(nd_alsfrs)[ (ncol(nd_alsfrs)-2): ncol(nd_alsfrs)] <- c("JM.pred", 
+                                                    "JM.pred.lo", "JM.pred.hi")
+
+g_JM_ALSFRS <- ggplot(nd_alsfrs, aes(x=alsfrs_dly_mnths, y = JM.pred, col=C9)) +
+    geom_line() +
+    geom_ribbon(aes(ymin=JM.pred.lo, ymax=JM.pred.hi, fill=C9, linetype=NA), 
+                alpha=0.15) +
+    theme.apply + coord_cartesian(xlim=c(0, 72), ylim=c(0, 12)) +
+    scale_x_continuous(breaks = c(0, 12, 24, 36, 48, 60, 72)) + 
+    scale_y_continuous(breaks = c(0, 3, 6, 9, 12)) +
+    labs(x="\nTime from onset (months)", y="Score\n") +
+    ggtitle(label = "ALSFRS Respiratory sub-score")
+print(g_JM_ALSFRS)
+# Save plot to file
+tiff('Graphs/Figure3.tiff', width=1000, height=700, res=108)
+    print(g_JM_ALSFRS)
+dev.off()
+
+```
+
+The ALSFRS respiratory subscores predicted from the linear mixed models show less distinction between C9 normal and C9 expanded cases. Indeed, they are indistinguishable for the first 2.5 - 3 years before the C9 expanded curve tends to decrease more quickly. This stands in contrast to the occluded SNIP graphs, which are distinct throughout the follow-up time.
+
+\newpage
+## Exploration of trend over time of C9 x gender x site of onset subgroups
+
+To further explore the characteristics of occluded SNIP values in C9 patients over time, the joint model will be expanded to include longitudinal interactions of C9 with sex and site to investigate the hypothesis that the C9 expansion might affect respiratory function differently by sex and site of onset subgroups. We have seen previously that the prognostic impact of the C9 expansion is more prominent in male spinal onset cases.
+
+```{r c9_sex_site, echo=FALSE}
+lmeC9_sex_site <- lme(SNIP.occ ~ ns(onset2snip_mnths, 2) * C9 * sex * site,
+             random = ~ ns(onset2snip_mnths, 2)  | ID,
+                 data = df.snip_72m)
+
+# Fit a joint model for both - longitudinal value only
+JMFit_C9sexsite <- jointModelBayes(lmeC9_sex_site, coxC9,
+                                   timeVar = "onset2snip_mnths", verbose = FALSE)
+```
+
+Does the inclusion of sex and site improve the model fit? Can test this using anova of the respective JM's:
+```{r JM_anova, echo=FALSE}
+anova(JMFit_C9, JMFit_C9sexsite)
+```
+The inclusion of sex and site improves model fit by various measures.
+
+Summary of the joint model:
+```{r}
+summary(JMFit_C9sexsite)
+```
+
+Summary of the JM event process on exponential scale (i.e. to get Hazard Ratios)
+```{r}
+format(exp(summary(JMFit_C9sexsite)$`CoefTable-Event`), digits = 3)
+```
+
+
+Generate a plot of JM_C9sexsite model fit:
+
+```{r c9sexsite_plot, echo=FALSE}
+# Plot JM
+nd <- predict(JMFit_C9sexsite, newdata=nd, interval="conf", returnData = TRUE)
+nd$se.fit <- NULL
+names(nd)[ (ncol(nd)-2): ncol(nd)] <- c("JM_C9sexsite.pred",
+                                "JM_C9sexsite.pred.lo", "JM_C9sexsite.pred.hi")
+
+g_JM_C9sexsite <- ggplot(nd, aes(x=onset2snip_mnths , y = JM_C9sexsite.pred, 
+                                 col=C9)) + geom_line() +
+    geom_ribbon(aes(ymin=JM_C9sexsite.pred.lo, ymax=JM_C9sexsite.pred.hi, 
+                    fill=C9, linetype=NA), alpha=0.15) +
+    theme.apply + coord_cartesian(xlim=c(0, 72), ylim=c(0, 100)) +
+    scale_x_continuous(breaks = c(0, 12, 24, 36, 48, 60, 72)) + 
+    labs(x="\nTime from onset (months)", y="cmH2O\n") +
+    ggtitle(label = "Predicted occluded SNIP vs time by subgroups") +
+    facet_wrap(~ site + sex) 
+print(g_JM_C9sexsite)
+# Save plot to file
+tiff('Graphs/Figure2.tiff', width=1000, height=700, res=108)
+    print(g_JM_C9sexsite)
+dev.off()
+
+
+```
+
+For male spinal onset patients there is a clear difference between C9 normal and C9 expanded groups. There is a difference also for male bulbar onset patients although confidence intervals overlap. For female spinal and bulbar onset patients there is little difference in longitudinal SNIP characteristics between C9 normal and C9 expanded patients.
+
+
+
+
