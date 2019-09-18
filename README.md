@@ -1,4 +1,4 @@
-This repo contains the RMarkdown analysis file and subsequent html file for the paper:
+This repo contains the RMarkdown analysis file and subsequent output pdf file for the paper:
 
 ### The C9orf72 expansion is associated with accelerated respiratory function decline in a large Amyotrophic Lateral Sclerosis cohort
 
